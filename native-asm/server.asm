@@ -49,7 +49,6 @@ bind_localhost:
         mov     dword [server_addr+4],eax
 
 bind_ready:
-        invoke  setsockopt,[server_socket],0FFFFh,4,reuse_opt,4
         invoke  bind,[server_socket],server_addr,16
         cmp     eax,0
         jne     open_existing_and_exit
