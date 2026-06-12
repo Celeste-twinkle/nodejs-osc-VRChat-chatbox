@@ -121,6 +121,14 @@ accept_loop:
         cmp     eax,1
         je      handle_post_settings
 
+        call    is_get_history
+        cmp     eax,1
+        je      handle_get_history
+
+        call    is_post_history
+        cmp     eax,1
+        je      handle_post_history
+
         call    is_post_session_open
         cmp     eax,1
         je      handle_session_open
@@ -187,6 +195,14 @@ send_no_content:
 
 handle_get_settings:
         call    serve_settings
+        jmp     close_client
+
+handle_get_history:
+        call    serve_history
+        jmp     close_client
+
+handle_post_history:
+        call    write_history
         jmp     close_client
 
 handle_post_settings:
@@ -568,7 +584,7 @@ show_tray_menu:
         invoke  AppendMenuW,[tray_menu],0,ID_TRAY_EXIT,[tray_exit_text]
         invoke  GetCursorPos,pt
         invoke  SetForegroundWindow,[tray_hwnd]
-        invoke  TrackPopupMenu,[tray_menu],TPM_RIGHTBUTTON+TPM_RETURNCMD,[pt.x],[pt.y],0,[tray_hwnd],0
+        invoke  TrackPopupMenu,[tray_menu],TPM_RIGHTBUTTON+TPM_RETURNCMD+TPM_BOTTOMALIGN,[pt.x],[pt.y],0,[tray_hwnd],0
         mov     ebx,eax
         invoke  DestroyMenu,[tray_menu]
         cmp     ebx,ID_TRAY_OPEN
@@ -693,6 +709,24 @@ is_post_settings:
         mov     esi,recv_buf
         mov     edi,post_settings
         mov     ecx,post_settings_len
+        repe    cmpsb
+        sete    al
+        movzx   eax,al
+        ret
+
+is_get_history:
+        mov     esi,recv_buf
+        mov     edi,get_history
+        mov     ecx,get_history_len
+        repe    cmpsb
+        sete    al
+        movzx   eax,al
+        ret
+
+is_post_history:
+        mov     esi,recv_buf
+        mov     edi,post_history
+        mov     ecx,post_history_len
         repe    cmpsb
         sete    al
         movzx   eax,al
@@ -1318,6 +1352,71 @@ serve_index:
         invoke  send,[client_socket],html,html_len,0
         ret
 
+serve_history:
+        invoke  CreateFile,history_file,80000000h,1,0,3,80h,0
+        cmp     eax,-1
+        je      .empty
+        mov     [settings_handle],eax
+        invoke  ReadFile,[settings_handle],recv_buf,recv_buf_size-1,bytes_done,0
+        invoke  CloseHandle,[settings_handle]
+        invoke  send,[client_socket],http_200_json,http_200_json_len,0
+        mov     eax,[bytes_done]
+        test    eax,eax
+        jz      .empty_body
+        invoke  send,[client_socket],recv_buf,[bytes_done],0
+        ret
+.empty:
+        invoke  send,[client_socket],http_200_json,http_200_json_len,0
+.empty_body:
+        invoke  send,[client_socket],empty_history_json,empty_history_json_len,0
+        ret
+
+write_history:
+        call    find_body
+        test    eax,eax
+        jz      send_no_content
+        mov     esi,eax
+        mov     [body_ptr],esi
+        call    parse_content_length
+        mov     [content_len],eax
+        mov     ecx,[recv_len]
+        sub     ecx,[body_ptr]
+        add     ecx,recv_buf
+        mov     [body_have],ecx
+.read_more:
+        mov     eax,[body_have]
+        cmp     eax,[content_len]
+        jge     .len_ready
+        mov     eax,recv_buf
+        add     eax,[recv_len]
+        mov     edx,recv_buf_size-1
+        sub     edx,[recv_len]
+        jle     .len_ready
+        invoke  recv,[client_socket],eax,edx,0
+        cmp     eax,0
+        jle     .len_ready
+        add     [recv_len],eax
+        add     [body_have],eax
+        jmp     .read_more
+.len_ready:
+        mov     ecx,[content_len]
+        cmp     ecx,[body_have]
+        jle     .have_ok
+        mov     ecx,[body_have]
+.have_ok:
+        cmp     ecx,recv_buf_size-1
+        jle     .size_ok
+        mov     ecx,recv_buf_size-1
+.size_ok:
+        mov     [settings_write_len],ecx
+        invoke  CreateFile,history_file,40000000h,0,0,2,80h,0
+        cmp     eax,-1
+        je      send_no_content
+        mov     [settings_handle],eax
+        invoke  WriteFile,[settings_handle],[body_ptr],[settings_write_len],bytes_done,0
+        invoke  CloseHandle,[settings_handle]
+        jmp     send_no_content
+
 serve_settings:
         invoke  CreateFile,settings_file,80000000h,1,0,3,80h,0
         cmp     eax,-1
@@ -1377,50 +1476,11 @@ serve_lan_ip:
         ret
 
 find_host_lan_ip:
-        mov     dword [best_ip_score],0
-        invoke  gethostname,hostname,255
-        cmp     eax,0
-        jne     .not_found
-        invoke  gethostbyname,hostname
-        test    eax,eax
-        jz      .not_found
-        mov     ebx,eax
-        mov     edi,[ebx+12]
-        test    edi,edi
-        jz      .not_found
-.next_addr:
-        mov     ebx,[edi]
-        test    ebx,ebx
-        jz      .done
-        invoke  inet_ntoa,dword [ebx]
-        test    eax,eax
-        jz      .advance
-        mov     esi,eax
-        call    score_ip
-        cmp     eax,[best_ip_score]
-        jle     .advance
-        mov     [best_ip_score],eax
-        mov     [hlist_ptr],edi
-        mov     edi,best_ip
-        mov     ecx,15
-.copy_best:
-        lodsb
-        stosb
-        test    al,al
-        jz      .copied
-        loop    .copy_best
-        mov     byte [edi],0
-.copied:
-        mov     edi,[hlist_ptr]
-        cmp     dword [best_ip_score],3
-        je      .done
-.advance:
-        add     edi,4
-        jmp     .next_addr
-.done:
-        cmp     dword [best_ip_score],0
+        mov     dword [best_ip_score],-1
+        mov     byte [best_ip],0
+        call    scan_interfaces_best
+        cmp     dword [best_ip_score],-1
         jg      .found
-.not_found:
         xor     eax,eax
         ret
 .found:
@@ -1495,17 +1555,37 @@ parse_octet:
         ret
 
 send_lan_json:
-        mov     edi,lan_json+7
+        cmp     byte [best_ip],0
+        je      .selected_ready
+        mov     esi,best_ip
+.selected_ready:
+        mov     edi,selected_ip
         mov     ecx,15
-.copy_ip:
+.copy_selected:
         lodsb
         stosb
         test    al,al
-        jz      .ip_done
-        loop    .copy_ip
+        jz      .selected_done
+        loop    .copy_selected
         mov     byte [edi],0
-.ip_done:
-        dec     edi
+.selected_done:
+        mov     edi,lan_json
+        mov     esi,lan_json_head
+        mov     ecx,lan_json_head_len
+        rep     movsb
+        mov     esi,selected_ip
+        call    append_raw_ip
+        mov     esi,lan_json_mid
+        mov     ecx,lan_json_mid_len
+        rep     movsb
+        mov     dword [lan_first],1
+        mov     esi,selected_ip
+        call    append_json_ip
+        mov     [lan_json_ptr],edi
+
+        call    append_interfaces_to_lan_json
+.list_done:
+        mov     edi,[lan_json_ptr]
         mov     esi,lan_json_tail
         mov     ecx,lan_json_tail_len
         rep     movsb
@@ -1514,6 +1594,179 @@ send_lan_json:
         mov     [lan_json_len],eax
         invoke  send,[client_socket],http_200_json,http_200_json_len,0
         invoke  send,[client_socket],lan_json,[lan_json_len],0
+        ret
+
+append_raw_ip:
+        mov     ecx,15
+.raw_loop:
+        lodsb
+        test    al,al
+        jz      .raw_done
+        stosb
+        loop    .raw_loop
+.raw_done:
+        ret
+
+append_json_ip:
+        cmp     dword [lan_first],1
+        je      .first
+        mov     al,','
+        stosb
+        jmp     .quote
+.first:
+        mov     dword [lan_first],0
+.quote:
+        mov     al,'"'
+        stosb
+        call    append_raw_ip
+        mov     al,'"'
+        stosb
+        ret
+
+ip_equals_selected:
+        mov     edi,selected_ip
+.compare:
+        mov     al,[esi]
+        cmp     al,[edi]
+        jne     .no
+        test    al,al
+        jz      .yes
+        inc     esi
+        inc     edi
+        jmp     .compare
+.yes:
+        mov     eax,1
+        ret
+.no:
+        xor     eax,eax
+        ret
+
+scan_interfaces_best:
+        call    load_interface_list
+        cmp     eax,1
+        jne     .done
+        mov     edi,ip_table+4
+        mov     ecx,[if_count]
+.loop:
+        test    ecx,ecx
+        jz      .done
+        mov     [if_ptr],edi
+        push    ecx
+        invoke  inet_ntoa,dword [edi]
+        test    eax,eax
+        jz      .next
+        mov     esi,eax
+        call    usable_ip_string
+        cmp     eax,1
+        jne     .next
+        mov     esi,if_text
+        call    score_ip
+        cmp     eax,[best_ip_score]
+        jle     .next
+        mov     [best_ip_score],eax
+        mov     esi,if_text
+        mov     edi,best_ip
+        mov     ecx,15
+.copy_best:
+        lodsb
+        stosb
+        test    al,al
+        jz      .copied
+        loop    .copy_best
+        mov     byte [edi],0
+.copied:
+        cmp     dword [best_ip_score],3
+        je      .finish_pop
+.next:
+        pop     ecx
+        mov     edi,[if_ptr]
+        add     edi,24
+        dec     ecx
+        jmp     .loop
+.finish_pop:
+        pop     ecx
+.done:
+        ret
+
+append_interfaces_to_lan_json:
+        call    load_interface_list
+        cmp     eax,1
+        jne     .done
+        mov     edi,ip_table+4
+        mov     ecx,[if_count]
+.loop:
+        test    ecx,ecx
+        jz      .done
+        mov     [if_ptr],edi
+        push    ecx
+        invoke  inet_ntoa,dword [edi]
+        test    eax,eax
+        jz      .next
+        mov     esi,eax
+        call    usable_ip_string
+        cmp     eax,1
+        jne     .next
+        mov     esi,if_text
+        call    ip_equals_selected
+        cmp     eax,1
+        je      .next
+        mov     edi,[lan_json_ptr]
+        mov     esi,if_text
+        call    append_json_ip
+        mov     [lan_json_ptr],edi
+.next:
+        pop     ecx
+        mov     edi,[if_ptr]
+        add     edi,24
+        dec     ecx
+        jmp     .loop
+.done:
+        ret
+
+load_interface_list:
+        mov     dword [ip_table_len],ip_table_size
+        invoke  GetIpAddrTable,ip_table,ip_table_len,0
+        test    eax,eax
+        jnz     .fail
+        mov     eax,dword [ip_table]
+        mov     [if_count],eax
+        mov     eax,1
+        ret
+.fail:
+        xor     eax,eax
+        ret
+
+usable_ip_string:
+        mov     edi,if_text
+        mov     ecx,15
+.copy:
+        lodsb
+        stosb
+        test    al,al
+        jz      .copied
+        loop    .copy
+        mov     byte [edi],0
+.copied:
+        cmp     byte [if_text],0
+        je      .no
+        cmp     dword [if_text],'0.0.'
+        jne     .not_zero
+        cmp     dword [if_text+4],'0.0'
+        je      .no
+.not_zero:
+        cmp     byte [if_text],'1'
+        jne     .yes
+        cmp     byte [if_text+1],'2'
+        jne     .yes
+        cmp     byte [if_text+2],'7'
+        jne     .yes
+        cmp     byte [if_text+3],'.'
+        je      .no
+.yes:
+        mov     eax,1
+        ret
+.no:
+        xor     eax,eax
         ret
 
 send_osc:
@@ -1596,6 +1849,10 @@ get_settings db 'GET /settings '
 get_settings_len = $ - get_settings
 post_settings db 'POST /settings '
 post_settings_len = $ - post_settings
+get_history db 'GET /history '
+get_history_len = $ - get_history
+post_history db 'POST /history '
+post_history_len = $ - post_history
 post_session_open db 'POST /session/open '
 post_session_open_len = $ - post_session_open
 post_session_close db 'POST /session/close '
@@ -1610,6 +1867,7 @@ post_typing db 'POST /typing '
 post_typing_len = $ - post_typing
 content_length_header db 'CONTENT-LENGTH:'
 settings_file db 'settings.json',0
+history_file db 'history.json',0
 dns_probe_ip db '8.8.8.8',0
 startup_key db 'Software\Microsoft\Windows\CurrentVersion\Run',0
 startup_value db 'VRC Chatbox OSC',0
@@ -1673,14 +1931,18 @@ http_204_len = $ - http_204
 
 empty_json db '{}'
 empty_json_len = $ - empty_json
+empty_history_json db '[]'
+empty_history_json_len = $ - empty_history_json
 default_settings db '{"translate":true,"src":"zh-CN","dst":"en","provider":"mymemory","endpoint":"","model":"","key":"","mmEmail":"","mmKey":"","format":"both","uiLang":"auto","startup":false,"startMinimized":false,"lan":false}'
 default_settings_len = $ - default_settings
 reuse_opt dd 1
-lan_fallback_json db '{"ip":"127.0.0.1"}'
+lan_fallback_json db '{"ip":"127.0.0.1","ips":["127.0.0.1"]}'
 lan_fallback_json_len = $ - lan_fallback_json
-lan_json db '{"ip":"'
-         rb 16
-lan_json_tail db '"}'
+lan_json_head db '{"ip":"'
+lan_json_head_len = $ - lan_json_head
+lan_json_mid db '","ips":['
+lan_json_mid_len = $ - lan_json_mid
+lan_json_tail db ']}'
 lan_json_tail_len = $ - lan_json_tail
 lan_json_len dd 0
 
@@ -1700,9 +1962,9 @@ html db '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta nam
      db 'main{width:min(760px,100%);background:white;border:1px solid #d8dee8;border-radius:8px;box-shadow:0 18px 60px rgb(15 23 42/.10);overflow:hidden}'
      db 'header{display:flex;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid #d8dee8}h1{font-size:18px;margin:0}.s{color:#667085;font-size:13px}.s:before{content:"";display:inline-block;width:8px;height:8px;border-radius:99px;background:#0f766e;margin-right:8px}'
      db '.c{padding:20px}textarea{width:100%;min-height:260px;resize:vertical;border:1px solid #d8dee8;border-radius:8px;padding:16px;background:#fbfcfe;color:#111827;font:inherit;font-size:18px;line-height:1.55;outline:0}textarea:focus{border-color:#0f766e;box-shadow:0 0 0 3px rgb(15 118 110/.16)}.wrap{position:relative}.cnt{position:absolute;right:10px;bottom:6px;font-size:12px;color:#9ca3af;pointer-events:none}'
-     db '.row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}select,input{width:100%;border:1px solid #d8dee8;border-radius:8px;padding:10px;background:#fbfcfe;color:#111827}label{display:block;color:#667085;font-size:12px;margin:0 0 5px}.lan{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:10px 12px;border:1px solid #d8dee8;border-radius:8px;margin-bottom:12px;background:#fbfcfe}.toggle{display:flex;align-items:center;gap:8px;margin-bottom:12px;color:#111827;font-size:13px}.toggle input{width:auto}.toggle.sub{margin-left:24px;color:#667085}.toggle:has(input:disabled){opacity:.58}.lan b{font-size:13px}.lan-note{display:block;margin-top:3px;color:#667085;font-size:12px}.lan code{font-size:13px;color:#115e59}.lan-actions{display:flex;gap:8px;align-items:center}.lan button{min-width:0;padding:9px 12px;font-size:13px}.a{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:14px;margin-top:14px}.rw{display:flex;justify-content:flex-end}.h,.m,.warn{color:#667085;font-size:13px}.warn{padding:10px;border:1px solid #fecdca;background:#fff5f4;color:#b42318;border-radius:8px;margin:0 0 12px}.hide{display:none}.modal{position:fixed;inset:0;z-index:20;display:grid;place-items:center;padding:18px;background:rgb(15 23 42/.32)}.modal.hide{display:none}.panel{width:min(680px,100%);max-height:min(82dvh,720px);overflow:auto;background:white;border:1px solid #d8dee8;border-radius:8px;box-shadow:0 20px 80px rgb(15 23 42/.24);padding:18px}.qrpanel{width:min(340px,calc(100vw - 32px));text-align:center}.qrpanel canvas{width:min(260px,100%);height:auto;image-rendering:pixelated;margin:6px auto 12px;display:block}.qrurl{display:block;color:#115e59;font-size:13px;word-break:break-all;text-decoration:none}.ph{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.ph b{font-size:16px}.x{min-width:0;padding:8px 12px;font-size:13px;background:#e5e7eb;color:#374151}.x:hover{background:#d1d5db}.linkbtn{display:flex;align-items:center;justify-content:center;border-radius:8px;padding:10px 12px;background:#eef8f6;color:#115e59;text-decoration:none;font-size:13px;font-weight:650}button{min-width:132px;border:0;border-radius:8px;padding:12px 18px;background:#0f766e;color:white;font:inherit;font-weight:650;cursor:pointer}button:hover{background:#115e59}button:active{transform:translateY(1px)}button:disabled{cursor:wait;opacity:.72}button.r{background:#dc2626}button.r:hover{background:#b91c1c}.e{color:#b42318}@media(max-width:560px){body{padding:12px;place-items:start}main{width:100%}header,.a,.row,.row2,.row3,.lan,.rw{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.lan-actions{align-items:stretch;flex-direction:column}button{width:100%}.toggle.sub{margin-left:0}.modal{place-items:end;padding:0}.panel{width:100%;max-height:88dvh;border-radius:8px 8px 0 0;padding:16px}.ph{position:sticky;top:0;background:white;z-index:1;padding-bottom:10px}}.hlist{max-height:220px;overflow-y:auto;margin-top:12px;border:1px solid #d8dee8;border-radius:8px}.hlist:empty{display:none}.hitem{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid #e5e7eb;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:none;transition:background .15s}.hitem:last-child{border-bottom:0}.hitem:hover{background:#f0fdf4}.hitem:active{background:#d1fae5}.htime{color:#9ca3af;font-size:11px;white-space:nowrap;margin-left:12px}.htext{flex:1;overflow:hidden}.hsrc{font-size:14px;color:#374151;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.htrans{font-size:12px;color:#9ca3af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}.hitem .del{color:#d1d5db;font-size:16px;line-height:1;padding:2px 6px;border-radius:4px}.hitem .del:hover{color:#ef4444;background:#fef2f2}.hitem.pressing{position:relative;overflow:hidden;background:#ecfdf5}.hitem.pressing::after{content:"";position:absolute;left:0;bottom:0;height:3px;background:#10b981;animation:fillBar .6s ease-out forwards}@keyframes fillBar{from{width:0}to{width:100%}}.fmt{margin-bottom:12px}.fmt select{width:auto;min-width:140px}.r{min-width:0;padding:9px 12px;font-size:13px}</style></head>'
-     db '<body><main><header><h1>VRC Chatbox OSC</h1><div class="s" id="status">本地服务已连接</div></header><section class="c"><div class="lan"><div><b>局域网访问地址</b><span class="lan-note">可在同一路由其他设备访问，如连接路由器wifi的手机</span></div><div class="lan-actions"><code id="lan">仅本机</code><button id="settingsBtn" type="button">设置</button><button id="qrBtn" class="hide" type="button">二维码</button><button id="lanBtn" type="button">允许局域网连接</button></div></div><div id="qrModal" class="modal hide"><div class="panel qrpanel"><div class="ph"><b>局域网二维码</b><button id="qrClose" class="x" type="button">关闭</button></div><canvas id="qrCanvas" width="264" height="264"></canvas><a id="qrLink" class="qrurl" target="_blank" href="#"></a></div></div><div id="settingsModal" class="modal hide"><div class="panel"><div class="ph"><b>设置</b><button id="settingsClose" class="x" type="button">关闭</button></div><div class="row2"><div><label id="uiLangLabel">UI 语言</label><select id="uiLang"><option value="auto">Auto</option><option value="zh">中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select></div></div><label class="toggle"><input id="startup" type="checkbox">开机自启动</label><label class="toggle sub"><input id="startMinimized" type="checkbox">最小化自启动（开机启动时不打开浏览器）</label><label class="toggle"><input id="trOn" type="checkbox">启用翻译</label><div id="trBox" class="hide"><div class="row3"><div><label>源语言</label><select id="src"><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="es">Español</option></select></div><div><label>目标语言</label><select id="dst"><option value="en">English</option><option value="zh-CN">简体中文</option><option value="ja">日本語</option><option value="ko">한국어</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="es">Español</option></select></div><div><label>翻译服务</label><select id="provider"><option value="mymemory">MyMemory 免费公开 API</option><option value="openai">ChatGPT / OpenAI</option><option value="deepseek">DeepSeek</option><option value="hunyuan">腾讯混元</option><option value="custom">自定义 OpenAI 兼容 API</option></select></div></div><div class="warn">Key 会保存到本机 settings.json。不要把这个文件复制或发送给任何人。若 MyMemory 翻译失败或提示额度不足，请尝试填写 email，或自行获取 key 后使用。</div><div id="mmBox" class="row"><input id="mmEmail" placeholder="MyMemory email，可提升免费额度"><input id="mmKey" placeholder="MyMemory key，可选"><a class="linkbtn" target="_blank" href="https://mymemory.translated.net/doc/keygen.php">获取 MyMemory key</a></div><div id="aiBox" class="row hide"><input id="endpoint" placeholder="AI Base URL，例如 https://api.openai.com/v1"><input id="model" placeholder="模型，例如 gpt-4o-mini / deepseek-chat"><input id="key" placeholder="AI API Key"></div><div id="fmtBox" class="fmt hide"><label>翻译格式</label><select id="fmt"><option value="both">原文 + 译文</option><option value="trans">仅译文</option><option value="orig">仅原文（不翻译）</option></select></div></div></div></div><div class="wrap"><textarea id="text" autofocus placeholder="输入要直接发送到 VRChat Chatbox 的文字。"></textarea><span id="cnt" class="cnt">0/144</span></div><div class="a"><div class="h" id="hint">Enter 发送，Shift + Enter 换行</div><button id="button" type="button">发送</button><div class="rw"><button id="clearBtn" class="r" type="button">清空</button></div></div><div class="m" id="message"></div><div id="hlist" class="hlist"></div></section></main>'
-     db '<script>const $=id=>document.getElementById(id),b=$("button"),t=$("text"),m=$("message"),s=$("status"),lan=$("lan"),lanBtn=$("lanBtn"),qrBtn=$("qrBtn"),qrModal=$("qrModal"),qrClose=$("qrClose"),qrCanvas=$("qrCanvas"),qrLink=$("qrLink"),trOn=$("trOn"),trBox=$("trBox"),hint=$("hint"),src=$("src"),dst=$("dst"),p=$("provider"),ep=$("endpoint"),model=$("model"),key=$("key"),mmEmail=$("mmEmail"),mmKey=$("mmKey"),mmBox=$("mmBox"),aiBox=$("aiBox"),fmt=$("fmt"),hlist=$("hlist"),fmtBox=$("fmtBox"),uiLang=$("uiLang"),uiLangLabel=$("uiLangLabel"),startup=$("startup"),startMinimized=$("startMinimized"),clearBtn=$("clearBtn"),cnt=$("cnt"),settingsBtn=$("settingsBtn"),settingsModal=$("settingsModal"),settingsClose=$("settingsClose");let timer=0,typingTimer=0,history=[],hidCounter=0,longPressTimer=0,longPressFired=false,lanAllowed=false;const maxHistory=20;const I18N={"zh":{"connected":"本地服务已连接","lanTitle":"局域网访问地址","lanNote":"可在同一路由其他设备访问，如连接路由器wifi的手机","localOnly":"仅本机","settings":"设置","qr":"二维码","allowLan":"允许局域网连接","lanQr":"局域网二维码","close":"关闭","startup":"开机自启动","startMinimized":"最小化自启动（开机启动时不打开浏览器）","enableTranslate":"启用翻译","uiLang":"UI 语言","srcLang":"源语言","dstLang":"目标语言","provider":"翻译服务","warn":"Key 会保存到本机 settings.json。不要把这个文件复制或发送给任何人。若 MyMemory 翻译失败或提示额度不足，请尝试填写 email，或自行获取 key 后使用。","mmEmail":"MyMemory email，可提升免费额度","mmKey":"MyMemory key，可选","mmKeyLink":"获取 MyMemory key","aiEndpoint":"AI Base URL，例如 https://api.openai.com/v1","aiModel":"模型，例如 gpt-4o-mini / deepseek-chat","aiKey":"AI API Key","format":"翻译格式","fmtBoth":"原文 + 译文","fmtTrans":"仅译文","fmtOrig":"仅原文（不翻译）","send":"发送","translateSend":"翻译发送","clear":"清空","enterSend":"Enter 发送，Shift + Enter 换行","enterAction":"Enter {action}，Shift + Enter 换行","phDirect":"输入要直接发送到 VRChat Chatbox 的文字。","phOrig":"输入要发送的文字（不翻译）。","phTrans":"输入源语言。发送时仅发送译文。","phBoth":"输入源语言。发送时会把译文换行拼接到源语言后面。","lanFail":"开启失败","allowed":"已允许","retry":"重试","opening":"正在开启","lanOk":"已允许局域网连接","lanBad":"局域网连接开启失败","empty":"请输入内容后再发送。","translating":"翻译中...","sending":"发送中...","sentTrans":"已翻译并发送到 VRChat。","sent":"已发送到 VRChat。","sentStatus":"刚刚发送成功","missingAI":"请先填写 AI endpoint、model 和 API Key。","emptyTrans":"翻译失败或返回为空，请检查 API 配置或切换格式。","transFail":"翻译失败或发送失败。若使用 MyMemory，请尝试填写 email，或点击按钮自行获取 key 后使用。","sendFail":"发送失败，请确认 VRChat OSC 已开启。","badConn":"连接异常","historyFilled":"已填入历史消息，修改后按 Enter 发送","resending":"重发中...","resent":"已重发到 VRChat。","resentStatus":"刚刚重发成功","resendFail":"重发失败，请确认 VRChat OSC 已开启。"},"en":{"connected":"Local service connected","lanTitle":"LAN access URL","lanNote":"Use another device on the same router, such as a phone on Wi-Fi.","localOnly":"Local only","settings":"Settings","qr":"QR","allowLan":"Allow LAN access","lanQr":"LAN QR code","close":"Close","startup":"Start with Windows","startMinimized":"Start minimized (do not open browser on startup)","enableTranslate":"Enable translation","uiLang":"UI language","srcLang":"Source language","dstLang":"Target language","provider":"Translation provider","warn":"Keys are saved locally in settings.json. Do not copy or share this file. If MyMemory fails or quota is low, add an email or use your own key.","mmEmail":"MyMemory email for higher free quota","mmKey":"MyMemory key, optional","mmKeyLink":"Get MyMemory key","aiEndpoint":"AI Base URL, e.g. https://api.openai.com/v1","aiModel":"Model, e.g. gpt-4o-mini / deepseek-chat","aiKey":"AI API Key","format":"Send format","fmtBoth":"Original + translation","fmtTrans":"Translation only","fmtOrig":"Original only (no translation)","send":"Send","translateSend":"Translate + send","clear":"Clear","enterSend":"Enter to send, Shift + Enter for newline","enterAction":"Enter to {action}, Shift + Enter for newline","phDirect":"Type text to send directly to VRChat Chatbox.","phOrig":"Type text to send without translation.","phTrans":"Type source text. Only the translation will be sent.","phBoth":"Type source text. Translation will be appended on the next line.","lanFail":"Failed to enable","allowed":"Allowed","retry":"Retry","opening":"Enabling","lanOk":"LAN access allowed","lanBad":"Failed to enable LAN access","empty":"Type something before sending.","translating":"Translating...","sending":"Sending...","sentTrans":"Translated and sent to VRChat.","sent":"Sent to VRChat.","sentStatus":"Sent just now","missingAI":"Fill in AI endpoint, model, and API key first.","emptyTrans":"Translation failed or returned empty. Check API settings or switch format.","transFail":"Translation or sending failed. If using MyMemory, try adding an email or your own key.","sendFail":"Send failed. Make sure VRChat OSC is enabled.","badConn":"Connection issue","historyFilled":"History message restored. Edit it, then press Enter to send.","resending":"Resending...","resent":"Resent to VRChat.","resentStatus":"Resent just now","resendFail":"Resend failed. Make sure VRChat OSC is enabled."},"ja":{"connected":"ローカルサービスに接続済み","lanTitle":"LANアクセスURL","lanNote":"同じルーター上の端末、たとえばWi-Fi接続のスマートフォンからアクセスできます。","localOnly":"このPCのみ","settings":"設定","qr":"QR","allowLan":"LAN接続を許可","lanQr":"LAN QRコード","close":"閉じる","startup":"Windows起動時に開始","startMinimized":"最小化起動（自動起動時にブラウザーを開かない）","enableTranslate":"翻訳を有効化","uiLang":"UI言語","srcLang":"元の言語","dstLang":"翻訳先言語","provider":"翻訳サービス","warn":"キーはローカルの settings.json に保存されます。このファイルをコピー、共有しないでください。MyMemoryが失敗する場合や上限に近い場合は、メールアドレスまたは自分のキーを設定してください。","mmEmail":"MyMemory email（無料枠を増やす）","mmKey":"MyMemory key（任意）","mmKeyLink":"MyMemory keyを取得","aiEndpoint":"AI Base URL 例: https://api.openai.com/v1","aiModel":"モデル 例: gpt-4o-mini / deepseek-chat","aiKey":"AI API Key","format":"送信形式","fmtBoth":"原文 + 翻訳","fmtTrans":"翻訳のみ","fmtOrig":"原文のみ（翻訳しない）","send":"送信","translateSend":"翻訳して送信","clear":"クリア","enterSend":"Enterで送信、Shift + Enterで改行","enterAction":"Enterで{action}、Shift + Enterで改行","phDirect":"VRChat Chatbox に直接送信する文字を入力します。","phOrig":"翻訳せず送信する文字を入力します。","phTrans":"元の言語で入力します。送信時は翻訳のみ送ります。","phBoth":"元の言語で入力します。翻訳を次の行に追加して送信します。","lanFail":"有効化に失敗","allowed":"許可済み","retry":"再試行","opening":"有効化中","lanOk":"LAN接続を許可しました","lanBad":"LAN接続の有効化に失敗しました","empty":"内容を入力してから送信してください。","translating":"翻訳中...","sending":"送信中...","sentTrans":"翻訳してVRChatへ送信しました。","sent":"VRChatへ送信しました。","sentStatus":"送信しました","missingAI":"AI endpoint、model、API Key を先に入力してください。","emptyTrans":"翻訳に失敗したか、空の結果です。API設定または形式を確認してください。","transFail":"翻訳または送信に失敗しました。MyMemoryを使う場合はメールまたはキーを設定してください。","sendFail":"送信に失敗しました。VRChat OSC が有効か確認してください。","badConn":"接続エラー","historyFilled":"履歴を入力欄に戻しました。編集してEnterで送信できます。","resending":"再送信中...","resent":"VRChatへ再送信しました。","resentStatus":"再送信しました","resendFail":"再送信に失敗しました。VRChat OSC が有効か確認してください。"},"ko":{"connected":"로컬 서비스 연결됨","lanTitle":"LAN 접속 주소","lanNote":"같은 라우터의 다른 기기, 예를 들어 Wi-Fi에 연결된 휴대폰에서 접속할 수 있습니다.","localOnly":"이 PC만","settings":"설정","qr":"QR","allowLan":"LAN 접속 허용","lanQr":"LAN QR 코드","close":"닫기","startup":"Windows 시작 시 실행","startMinimized":"최소화 시작(자동 시작 시 브라우저 열지 않음)","enableTranslate":"번역 사용","uiLang":"UI 언어","srcLang":"원본 언어","dstLang":"대상 언어","provider":"번역 서비스","warn":"키는 로컬 settings.json에 저장됩니다. 이 파일을 복사하거나 공유하지 마세요. MyMemory가 실패하거나 한도가 부족하면 email 또는 개인 key를 설정하세요.","mmEmail":"MyMemory email, 무료 한도 증가","mmKey":"MyMemory key, 선택 사항","mmKeyLink":"MyMemory key 받기","aiEndpoint":"AI Base URL 예: https://api.openai.com/v1","aiModel":"모델 예: gpt-4o-mini / deepseek-chat","aiKey":"AI API Key","format":"전송 형식","fmtBoth":"원문 + 번역","fmtTrans":"번역만","fmtOrig":"원문만(번역 안 함)","send":"전송","translateSend":"번역 후 전송","clear":"지우기","enterSend":"Enter 전송, Shift + Enter 줄바꿈","enterAction":"Enter {action}, Shift + Enter 줄바꿈","phDirect":"VRChat Chatbox로 바로 보낼 문장을 입력하세요.","phOrig":"번역하지 않고 보낼 문장을 입력하세요.","phTrans":"원본 언어로 입력하세요. 전송 시 번역만 보냅니다.","phBoth":"원본 언어로 입력하세요. 번역을 다음 줄에 붙여 보냅니다.","lanFail":"활성화 실패","allowed":"허용됨","retry":"다시 시도","opening":"활성화 중","lanOk":"LAN 접속을 허용했습니다","lanBad":"LAN 접속 활성화 실패","empty":"내용을 입력한 뒤 전송하세요.","translating":"번역 중...","sending":"전송 중...","sentTrans":"번역 후 VRChat에 전송했습니다.","sent":"VRChat에 전송했습니다.","sentStatus":"방금 전송됨","missingAI":"AI endpoint, model, API Key를 먼저 입력하세요.","emptyTrans":"번역 실패 또는 빈 결과입니다. API 설정이나 형식을 확인하세요.","transFail":"번역 또는 전송에 실패했습니다. MyMemory 사용 시 email 또는 개인 key를 설정해 보세요.","sendFail":"전송 실패. VRChat OSC가 켜져 있는지 확인하세요.","badConn":"연결 오류","historyFilled":"히스토리 메시지를 입력창에 넣었습니다. 수정 후 Enter로 전송하세요.","resending":"재전송 중...","resent":"VRChat에 재전송했습니다.","resentStatus":"방금 재전송됨","resendFail":"재전송 실패. VRChat OSC가 켜져 있는지 확인하세요."}};let lang="zh";function pickLang(v){let n=(v&&v!=="auto"?v:(navigator.language||"zh")).toLowerCase();if(n.startsWith("ja"))return"ja";if(n.startsWith("ko"))return"ko";if(n.startsWith("en"))return"en";return"zh"}function L(k){return(I18N[lang]&&I18N[lang][k])||I18N.zh[k]||k}function tx(el,k){if(el)el.textContent=L(k)}function opt(el,i,k){if(el&&el.options[i])el.options[i].textContent=L(k)}function lab(input,k){if(!input)return;let n=input.nextSibling;if(n)n.nodeValue=L(k)}function applyLang(){lang=pickLang(uiLang.value);document.documentElement.lang=lang==="zh"?"zh-CN":lang;tx(s,"connected");tx(document.querySelector(".lan b"),"lanTitle");tx(document.querySelector(".lan-note"),"lanNote");tx(settingsBtn,"settings");tx(qrBtn,"qr");tx(document.querySelector("#qrModal .ph b"),"lanQr");tx(qrClose,"close");tx(document.querySelector("#settingsModal .ph b"),"settings");tx(settingsClose,"close");tx(uiLangLabel,"uiLang");lab(startup,"startup");lab(startMinimized,"startMinimized");lab(trOn,"enableTranslate");let labs=trBox.querySelectorAll("label");tx(labs[0],"srcLang");tx(labs[1],"dstLang");tx(labs[2],"provider");tx(document.querySelector(".warn"),"warn");mmEmail.placeholder=L("mmEmail");mmKey.placeholder=L("mmKey");tx(document.querySelector(".linkbtn"),"mmKeyLink");ep.placeholder=L("aiEndpoint");model.placeholder=L("aiModel");key.placeholder=L("aiKey");tx(fmtBox.querySelector("label"),"format");opt(fmt,0,"fmtBoth");opt(fmt,1,"fmtTrans");opt(fmt,2,"fmtOrig");tx(clearBtn,"clear");setLanState(qrBtn.dataset.ip||"127.0.0.1",qrBtn.dataset.fail==="1");showBoxes()}const sid=(Date.now().toString(36)+Math.random().toString(36).slice(2,10)).slice(0,31);function beat(){fetch("/heartbeat?id="+encodeURIComponent(sid),{method:"POST"}).catch(()=>{})}beat();setInterval(beat,3000);function setTyping(on){if(!on){try{navigator.sendBeacon&&navigator.sendBeacon("/typing","false")}catch(e){}}fetch("/typing",{method:"POST",body:on?"true":"false",keepalive:true}).catch(function(){})}function sendTyping(){setTyping(!!t.value.trim())}window.addEventListener("pagehide",function(){setTyping(false)});function openSettings(){settingsModal.className="modal"}function closeSettings(){settingsModal.className="modal hide"}settingsBtn.addEventListener("click",openSettings);settingsClose.addEventListener("click",closeSettings);settingsModal.addEventListener("click",function(e){if(e.target===settingsModal)closeSettings()});function openQr(){let u=qrBtn.dataset.url;if(!u)return;drawQr(qrCanvas,u);qrLink.href=u;qrLink.textContent=u;qrModal.className="modal"}function closeQr(){qrModal.className="modal hide"}qrBtn.addEventListener("click",openQr);qrClose.addEventListener("click",closeQr);qrModal.addEventListener("click",function(e){if(e.target===qrModal)closeQr()});document.addEventListener("keydown",function(e){if(e.key==="Escape"){closeSettings();closeQr()}});function setLanState(ip,fail){const on=!fail&&ip!=="127.0.0.1";const u=on?"http://"+ip+":19001":"";lanAllowed=on;qrBtn.dataset.ip=ip;qrBtn.dataset.fail=fail?"1":"0";lan.textContent=on?u:(fail?L("lanFail"):L("localOnly"));qrBtn.className=on?"":"hide";qrBtn.dataset.url=u;lanBtn.disabled=on;lanBtn.textContent=on?L("allowed"):(fail?L("retry"):L("allowLan"))}async function refreshLan(){try{const r=await fetch("/lan-ip");const j=await r.json();setLanState(j.ip,false)}catch(e){setLanState("127.0.0.1",false)}}async function enableLan(){lanBtn.disabled=true;lanBtn.textContent=L("opening");try{const r=await fetch("/lan-enable",{method:"POST"});const j=await r.json();const on=j.ip!=="127.0.0.1";setLanState(j.ip,!on);if(on)await save();s.textContent=on?L("lanOk"):L("lanBad")}catch(e){setLanState("127.0.0.1",true)}}function drawQr(c,txt){const N=29,D=55,E=15;let bits=[0,1,0,0];for(let i=7;i>=0;i--)bits.push(txt.length>>i&1);for(let ch of txt){let v=ch.charCodeAt(0);for(let i=7;i>=0;i--)bits.push(v>>i&1)}for(let i=0;i<4&&bits.length<D*8;i++)bits.push(0);while(bits.length%8)bits.push(0);let data=[];for(let i=0;i<bits.length;i+=8)data.push(bits.slice(i,i+8).reduce((a,b)=>a*2+b,0));for(let p=0xec;data.length<D;p=p==0xec?0x11:0xec)data.push(p);function gm(a,b){let r=0;for(;b;b>>=1){if(b&1)r^=a;a<<=1;if(a&256)a^=0x11d}return r}function gp(n){let r=1;while(n--)r=gm(r,2);return r}let g=[1];for(let i=0;i<E;i++){let ng=Array(g.length+1).fill(0),a=gp(i);for(let j=0;j<g.length;j++){ng[j]^=g[j];ng[j+1]^=gm(g[j],a)}g=ng}g=g.slice(1);let rem=Array(E).fill(0);for(let b of data){let f=b^rem.shift();rem.push(0);for(let i=0;i<E;i++)rem[i]^=gm(g[i],f)}let cw=data.concat(rem),m=Array.from({length:N},()=>Array(N).fill(-1));function set(x,y,v){if(x>=0&&y>=0&&x<N&&y<N)m[y][x]=v}function finder(x,y){for(let dy=-1;dy<8;dy++)for(let dx=-1;dx<8;dx++){let v=0;if(dx>=0&&dx<7&&dy>=0&&dy<7&&(dx==0||dx==6||dy==0||dy==6||(dx>=2&&dx<=4&&dy>=2&&dy<=4)))v=1;set(x+dx,y+dy,v)}}function align(x,y){for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++)set(x+dx,y+dy,Math.max(Math.abs(dx),Math.abs(dy))!=1?1:0)}finder(0,0);finder(N-7,0);finder(0,N-7);align(22,22);for(let i=8;i<N-8;i++){if(m[6][i]<0)set(i,6,i%2==0);if(m[i][6]<0)set(6,i,i%2==0)}for(let i=0;i<8;i++){set(N-1-i,8,0);set(8,N-1-i,0)}for(let i=0;i<6;i++){set(8,i,0);set(i,8,0)}set(8,7,0);set(8,8,0);set(7,8,0);for(let i=0;i<6;i++)set(5-i,8,0);set(8,21,1);let bi=0;for(let x=N-1,up=true;x>0;x-=2){if(x==6)x--;for(let yy=0;yy<N;yy++){let y=up?N-1-yy:yy;for(let dx=0;dx<2;dx++){let xx=x-dx;if(m[y][xx]<0){let bit=bi<cw.length*8?(cw[bi>>3]>>(7-(bi&7))&1):0;m[y][xx]=bit^((xx+y)%2==0);bi++}}}up=!up}let fmt=0b111011111000100;for(let i=0;i<15;i++){let v=fmt>>i&1;if(i<6)set(8,i,v);else if(i<8)set(8,i+1,v);else if(i==8)set(7,8,v);else set(14-i,8,v);if(i<8)set(N-1-i,8,v);else set(8,N-15+i,v)}let q=4,sc=Math.floor(c.width/(N+q*2)),ctx=c.getContext("2d");ctx.fillStyle="#fff";ctx.fillRect(0,0,c.width,c.height);ctx.fillStyle="#111827";for(let y=0;y<N;y++)for(let x=0;x<N;x++)if(m[y][x])ctx.fillRect((x+q)*sc,(y+q)*sc,sc,sc)}function showBoxes(){let on=trOn.checked,mm=p.value==="mymemory",f=fmt.value;trBox.className=on?"":"hide";mmBox.className=on&&mm?"row":"row hide";aiBox.className=on&&!mm?"row":"row hide";fmtBox.className=on?"fmt":"hide";let lb=f==="orig"?L("send"):L("translateSend");b.textContent=on?lb:L("send");hint.textContent=on?L("enterAction").replace("{action}",lb):L("enterSend");t.placeholder=on?(f==="orig"?L("phOrig"):f==="trans"?L("phTrans"):L("phBoth")):L("phDirect")}function preset(force){const ps={openai:["https://api.openai.com/v1","gpt-4o-mini"],deepseek:["https://api.deepseek.com","deepseek-chat"],hunyuan:["https://api.hunyuan.cloud.tencent.com/v1","hunyuan-turbos-latest"]}[p.value];if(!ps)return;if(force||!ep.value)ep.value=ps[0];if(force||!model.value)model.value=ps[1]}function syncStartup(){startMinimized.disabled=!startup.checked;if(!startup.checked)startMinimized.checked=false}async function load(){try{const r=await fetch("/settings");const j=await r.json();trOn.checked=!!j.translate;src.value=j.src||src.value;dst.value=j.dst||dst.value;p.value=j.provider||p.value;ep.value=j.endpoint||"";model.value=j.model||"";key.value=j.key||"";mmEmail.value=j.mmEmail||"";mmKey.value=j.mmKey||"";fmt.value=j.format||fmt.value;uiLang.value=j.uiLang||"auto";lang=pickLang(uiLang.value);startup.checked=!!j.startup;startMinimized.checked=!!j.startMinimized;lanAllowed=!!j.lan;syncStartup();preset(false);applyLang()}catch(e){syncStartup();applyLang()}}async function save(){clearTimeout(timer);syncStartup();const j={translate:trOn.checked,src:src.value,dst:dst.value,provider:p.value,endpoint:ep.value,model:model.value,key:key.value,mmEmail:mmEmail.value,mmKey:mmKey.value,format:fmt.value,uiLang:uiLang.value,startup:startup.checked,startMinimized:startMinimized.checked,lan:lanAllowed};try{await fetch("/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(j)})}catch(e){}}uiLang.addEventListener("change",()=>{applyLang();save()});trOn.addEventListener("change",()=>{showBoxes();save()});startup.addEventListener("change",()=>{syncStartup();save()});startMinimized.addEventListener("change",save);fmt.addEventListener("change",()=>{showBoxes();save()});p.addEventListener("change",()=>{preset(true);showBoxes();save()});[src,dst,ep,model,key,mmEmail,mmKey].forEach(x=>x.addEventListener("change",save));[key,ep,model,mmEmail,mmKey].forEach(x=>x.addEventListener("input",()=>{clearTimeout(timer);timer=setTimeout(save,600)}));async function tr(v){if(p.value!=="mymemory")return trAI(v);let u="https://api.mymemory.translated.net/get?q="+encodeURIComponent(v)+"&langpair="+encodeURIComponent(src.value+"|"+dst.value);if(mmEmail.value)u+="&de="+encodeURIComponent(mmEmail.value);if(mmKey.value)u+="&key="+encodeURIComponent(mmKey.value);let r=await fetch(u);let j=await r.json();return j.responseData&&j.responseData.translatedText?j.responseData.translatedText:""}function chatUrl(){let u=ep.value.trim().replace(/\/+$/,"");return u.endsWith("/chat/completions")?u:u+"/chat/completions"}async function trAI(v){if(!ep.value||!model.value||!key.value)throw Error("missing ai settings");let r=await fetch(chatUrl(),{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+key.value},body:JSON.stringify({model:model.value,messages:[{role:"system",content:"Translate the user text to "+dst.value+". Return only the translation."},{role:"user",content:v}]})});let j=await r.json();return j.choices&&j.choices[0]&&j.choices[0].message?j.choices[0].message.content:""}async function sendText(){const v=t.value.trim();if(!v){m.textContent=L("empty");m.className="m e";return}b.disabled=true;m.textContent=trOn.checked?L("translating"):L("sending");m.className="m";try{await save();let tv="",out="";if(trOn.checked&&fmt.value!=="orig"){tv=await tr(v)}if(trOn.checked&&fmt.value!=="orig"&&!tv){throw Error("empty trans")}if(trOn.checked){if(fmt.value==="trans")out=tv;else if(fmt.value==="orig")out=v;else out=v+"\n"+tv}else{out=v}const r=await fetch("/send",{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body:out});if(!r.ok)throw Error();var h={hid:++hidCounter,text:v,trans:tv,payload:out,time:new Date().toLocaleTimeString()};history.unshift(h);prependHistoryItem(h);trimHistory();t.value="";cnt.textContent="0/144";cnt.style.color="#9ca3af";clearInterval(typingTimer);typingTimer=0;setTyping(false);m.textContent=trOn.checked?L("sentTrans"):L("sent");s.textContent=L("sentStatus")}catch(e){m.textContent=e.message==="missing ai settings"?L("missingAI"):e.message==="empty trans"?L("emptyTrans"):trOn.checked?L("transFail"):L("sendFail");m.className="m e";s.textContent=L("badConn")}finally{b.disabled=false;t.focus()}}t.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendText()}});t.addEventListener("input",function(){clearTimeout(timer);timer=setTimeout(function(){sendTyping()},300);if(t.value.trim()){if(!typingTimer)typingTimer=setInterval(sendTyping,5000)}else{clearInterval(typingTimer);typingTimer=0;setTyping(false)}var n=t.value.length;cnt.textContent=n+"/144";cnt.style.color=n>144?"#ef4444":"#9ca3af"});b.addEventListener("click",sendText);lanBtn.addEventListener("click",enableLan);clearBtn.addEventListener("click",function(){t.value="";t.focus();cnt.textContent="0/144";cnt.style.color="#9ca3af";clearInterval(typingTimer);typingTimer=0;setTyping(false)});function renderHistory(){hlist.innerHTML=history.map(function(h){return buildItemHTML(h)}).join("")}function findByHid(hid){for(var i=0;i<history.length;i++)if(history[i].hid===hid)return i;return -1}function buildItemHTML(h){return "<div class=\"hitem\" id=\"hitem-"+h.hid+"\" onpointerdown=\"startLongPress(event,"+h.hid+")\" onpointerup=\"endLongPress(event,"+h.hid+")\" onpointercancel=\"cancelLongPress()\" onpointerleave=\"cancelLongPress()\"><span class=\"htext\"><span class=\"hsrc\">"+h.text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;")+"</span><span class=\"htrans\">"+(h.trans||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;")+"</span></span><span class=\"htime\">"+h.time+"</span><span class=\"del\" onpointerdown=\"event.stopPropagation()\" onpointerup=\"event.stopPropagation()\" onclick=\"event.stopPropagation();delHistory("+h.hid+")\">&times;</span></div>"}function prependHistoryItem(h){hlist.insertAdjacentHTML("afterbegin",buildItemHTML(h))}function trimHistory(){while(history.length>maxHistory){var old=history.pop(),el=$("hitem-"+old.hid);if(el)el.remove()}}function startLongPress(e,hid){e.preventDefault();clearTimeout(longPressTimer);longPressFired=false;var el=$("hitem-"+hid);if(el)el.classList.add("pressing");longPressTimer=setTimeout(function(){longPressFired=true;if(el)el.classList.remove("pressing");resendFromHistory(hid)},600)}function endLongPress(e,hid){e.preventDefault();clearTimeout(longPressTimer);var el=$("hitem-"+hid);if(el)el.classList.remove("pressing");if(!longPressFired){var i=findByHid(hid);if(i>=0){t.value=history[i].text;t.focus();m.textContent=L("historyFilled");m.className="m"}}}function cancelLongPress(){clearTimeout(longPressTimer);var els=document.querySelectorAll(".hitem.pressing");for(var j=0;j<els.length;j++)els[j].classList.remove("pressing")}async function resendFromHistory(hid){var i=findByHid(hid);if(i<0)return;var h=history[i];b.disabled=true;m.textContent=L("resending");m.className="m";try{let out=h.payload||h.text;const r=await fetch("/send",{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body:out});if(!r.ok)throw Error();m.textContent=L("resent");s.textContent=L("resentStatus")}catch(e){m.textContent=L("resendFail");m.className="m e";s.textContent=L("badConn")}finally{b.disabled=false}}function delHistory(hid){var i=findByHid(hid);if(i>=0)history.splice(i,1);var el=$("hitem-"+hid);if(el)el.remove()}syncStartup();applyLang();load();refreshLan();</script></body></html>'
+     db '.row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}.quick{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}select,input{width:100%;border:1px solid #d8dee8;border-radius:8px;padding:10px;background:#fbfcfe;color:#111827}label{display:block;color:#667085;font-size:12px;margin:0 0 5px}.lan{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:10px 12px;border:1px solid #d8dee8;border-radius:8px;margin-bottom:12px;background:#fbfcfe}.toggle{display:flex;align-items:center;gap:8px;margin-bottom:12px;color:#111827;font-size:13px}.toggle input{width:auto}.toggle.sub{margin-left:24px;color:#667085}.toggle:has(input:disabled){opacity:.58}.lan b{font-size:13px}.lan-note{display:block;margin-top:3px;color:#667085;font-size:12px}.lan code{font-size:13px;color:#115e59}.lan-actions{display:flex;gap:8px;align-items:center}.lan button{min-width:0;padding:9px 12px;font-size:13px}.a{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:14px;margin-top:14px}.rw{display:flex;justify-content:flex-end}.h,.m,.warn{color:#667085;font-size:13px}.warn{padding:10px;border:1px solid #fecdca;background:#fff5f4;color:#b42318;border-radius:8px;margin:0 0 12px}.hide{display:none}.modal{position:fixed;inset:0;z-index:20;display:grid;place-items:center;padding:18px;background:rgb(15 23 42/.32)}.modal.hide{display:none}.panel{width:min(680px,100%);max-height:min(82dvh,720px);overflow:auto;background:white;border:1px solid #d8dee8;border-radius:8px;box-shadow:0 20px 80px rgb(15 23 42/.24);padding:18px}.qrpanel{width:min(340px,calc(100vw - 32px));text-align:center}.qrpanel canvas{width:min(260px,100%);height:auto;image-rendering:pixelated;margin:6px auto 12px;display:block}.qrctrl{text-align:left;margin:8px 0 12px}.qrctrl label{display:block}.qrctrl select,.qrctrl input{font-size:13px}.qrctrl input{margin-top:8px}.qrurl{display:block;color:#115e59;font-size:13px;word-break:break-all;text-decoration:none}.ph{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.ph b{font-size:16px}.x{min-width:0;padding:8px 12px;font-size:13px;background:#e5e7eb;color:#374151}.x:hover{background:#d1d5db}.linkbtn{display:flex;align-items:center;justify-content:center;border-radius:8px;padding:10px 12px;background:#eef8f6;color:#115e59;text-decoration:none;font-size:13px;font-weight:650}button{min-width:132px;border:0;border-radius:8px;padding:12px 18px;background:#0f766e;color:white;font:inherit;font-weight:650;cursor:pointer}button:hover{background:#115e59}button:active{transform:translateY(1px)}button:disabled{cursor:wait;opacity:.72}button.r{background:#dc2626}button.r:hover{background:#b91c1c}.e{color:#b42318}@media(max-width:560px){body{padding:12px;place-items:start}main{width:100%}header,.a,.row,.row2,.row3,.lan,.rw{align-items:stretch;grid-template-columns:1fr;flex-direction:column}.lan-actions{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;align-items:stretch}.lan-actions code{grid-column:1/-1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.lan button{width:100%;padding:8px 6px;font-size:12px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#qrBtn.hide+#lanBtn{grid-column:span 2}.quick{grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);gap:6px;margin-bottom:10px}.quick label{font-size:11px;margin-bottom:4px}.quick select{padding:8px 4px;font-size:12px;min-width:0}button{width:100%}.toggle.sub{margin-left:0}.modal{place-items:end;padding:0}.panel{width:100%;max-height:88dvh;border-radius:8px 8px 0 0;padding:16px}.ph{position:sticky;top:0;background:white;z-index:1;padding-bottom:10px}.ph .x{width:auto;min-width:0;padding-left:16px;padding-right:16px}}.hbar{display:flex;justify-content:flex-end;margin-top:12px}.hbar.hide{display:none}.hlist{max-height:220px;overflow-y:auto;margin-top:12px;border:1px solid #d8dee8;border-radius:8px}.hlist:empty{display:none}.hitem{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid #e5e7eb;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:none;transition:background .15s}.hitem:last-child{border-bottom:0}.hitem:hover{background:#f0fdf4}.hitem:active{background:#d1fae5}.htime{color:#9ca3af;font-size:11px;white-space:nowrap;margin-left:12px}.htext{flex:1;overflow:hidden}.hsrc{font-size:14px;color:#374151;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.htrans{font-size:12px;color:#9ca3af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}.hitem .del{color:#d1d5db;font-size:16px;line-height:1;padding:2px 6px;border-radius:4px}.hitem .del:hover{color:#ef4444;background:#fef2f2}.hitem.pressing{position:relative;overflow:hidden;background:#ecfdf5}.hitem.pressing::after{content:"";position:absolute;left:0;bottom:0;height:3px;background:#10b981;animation:fillBar .6s ease-out forwards}@keyframes fillBar{from{width:0}to{width:100%}}.fmt{margin-bottom:12px}.fmt select{width:auto;min-width:140px}.r{min-width:0;padding:9px 12px;font-size:13px}</style></head>'
+     db '<body><main><header><h1>VRC Chatbox OSC</h1><div class="s" id="status">本地服务已连接</div></header><section class="c"><div class="lan"><div><b>局域网访问地址</b><span class="lan-note">可在同一路由其他设备访问，如连接路由器wifi的手机</span></div><div class="lan-actions"><code id="lan">仅本机</code><button id="settingsBtn" type="button">设置</button><button id="qrBtn" class="hide" type="button">二维码</button><button id="lanBtn" type="button">允许局域网连接</button></div></div><div id="qrModal" class="modal hide"><div class="panel qrpanel"><div class="ph"><b>局域网二维码</b><button id="qrClose" class="x" type="button">关闭</button></div><div class="qrctrl"><label id="qrHostLabel">二维码地址</label><select id="qrChoice"></select><input id="qrHost" placeholder="192.168.1.100:19001"></div><canvas id="qrCanvas" width="264" height="264"></canvas><a id="qrLink" class="qrurl" target="_blank" href="#"></a></div></div><div id="settingsModal" class="modal hide"><div class="panel"><div class="ph"><b>设置</b><button id="settingsClose" class="x" type="button">关闭</button></div><div class="row2"><div><label id="uiLangLabel">UI 语言</label><select id="uiLang"><option value="auto">Auto</option><option value="zh">中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select></div><div><label id="histLimitLabel">&#21382;&#21490;&#35760;&#24405;&#19978;&#38480;</label><input id="histLimit" type="number" min="1" max="200" value="100"></div></div><label class="toggle"><input id="startup" type="checkbox">开机自启动</label><label class="toggle sub"><input id="startMinimized" type="checkbox">最小化自启动（开机启动时不打开浏览器）</label><label class="toggle"><input id="trOn" type="checkbox">启用翻译</label><div id="trBox" class="hide"><div class="row2"><div><label id="settingsSrcLabel">&#28304;&#35821;&#35328;</label><select id="settingsSrc"></select></div><div><label id="settingsDstLabel">&#30446;&#26631;&#35821;&#35328;</label><select id="settingsDst"></select></div></div><div class="row2"><div><label id="settingsFmtLabel">&#32763;&#35793;&#26684;&#24335;</label><select id="settingsFmt"></select></div><div><label id="providerLabel">翻译服务</label><select id="provider"><option value="mymemory">MyMemory 免费公开 API</option><option value="openai">ChatGPT / OpenAI</option><option value="deepseek">DeepSeek</option><option value="hunyuan">腾讯混元</option><option value="custom">自定义 OpenAI 兼容 API</option></select></div></div><div class="warn">Key 会保存到本机 settings.json。不要把这个文件复制或发送给任何人。若 MyMemory 翻译失败或提示额度不足，请尝试填写 email，或自行获取 key 后使用。</div><div id="mmBox" class="row"><input id="mmEmail" placeholder="MyMemory email，可提升免费额度"><input id="mmKey" placeholder="MyMemory key，可选"><a class="linkbtn" target="_blank" href="https://mymemory.translated.net/doc/keygen.php">获取 MyMemory key</a></div><div id="aiBox" class="row hide"><input id="endpoint" placeholder="AI Base URL，例如 https://api.openai.com/v1"><input id="model" placeholder="模型，例如 gpt-4o-mini / deepseek-chat"><input id="key" placeholder="AI API Key"></div></div></div></div><div id="quickTr" class="quick hide"><div><label id="srcLabel">源语言</label><select id="src"><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="es">Español</option></select></div><div><label id="dstLabel">目标语言</label><select id="dst"><option value="en">English</option><option value="zh-CN">简体中文</option><option value="ja">日本語</option><option value="ko">한국어</option><option value="fr">Français</option><option value="de">Deutsch</option><option value="es">Español</option></select></div><div><label id="fmtLabel">翻译格式</label><select id="fmt"><option value="both">原文 + 译文</option><option value="trans">仅译文</option><option value="orig">仅原文（不翻译）</option></select></div></div><div class="wrap"><textarea id="text" autofocus placeholder="输入要直接发送到 VRChat Chatbox 的文字。"></textarea><span id="cnt" class="cnt">0/144</span></div><div class="a"><div class="h" id="hint">Enter 发送，Shift + Enter 换行</div><button id="button" type="button">发送</button><div class="rw"><button id="clearBtn" class="r" type="button">清空</button></div></div><div class="m" id="message"></div><div id="hbar" class="hbar hide"><button id="exportHistory" class="x" type="button">导出历史</button></div><div id="hlist" class="hlist"></div></section></main>'
+     db '<script>const $=id=>document.getElementById(id),b=$("button"),t=$("text"),m=$("message"),s=$("status"),lan=$("lan"),lanBtn=$("lanBtn"),qrBtn=$("qrBtn"),qrModal=$("qrModal"),qrClose=$("qrClose"),qrCanvas=$("qrCanvas"),qrLink=$("qrLink"),qrChoice=$("qrChoice"),qrHost=$("qrHost"),qrHostLabel=$("qrHostLabel"),trOn=$("trOn"),trBox=$("trBox"),hint=$("hint"),src=$("src"),dst=$("dst"),p=$("provider"),ep=$("endpoint"),model=$("model"),key=$("key"),mmEmail=$("mmEmail"),mmKey=$("mmKey"),mmBox=$("mmBox"),aiBox=$("aiBox"),fmt=$("fmt"),settingsSrc=$("settingsSrc"),settingsDst=$("settingsDst"),settingsFmt=$("settingsFmt"),settingsSrcLabel=$("settingsSrcLabel"),settingsDstLabel=$("settingsDstLabel"),settingsFmtLabel=$("settingsFmtLabel"),hlist=$("hlist"),quickTr=$("quickTr"),srcLabel=$("srcLabel"),dstLabel=$("dstLabel"),providerLabel=$("providerLabel"),fmtLabel=$("fmtLabel"),uiLang=$("uiLang"),uiLangLabel=$("uiLangLabel"),histLimit=$("histLimit"),histLimitLabel=$("histLimitLabel"),startup=$("startup"),startMinimized=$("startMinimized"),clearBtn=$("clearBtn"),cnt=$("cnt"),hbar=$("hbar"),exportHistory=$("exportHistory"),settingsBtn=$("settingsBtn"),settingsModal=$("settingsModal"),settingsClose=$("settingsClose");let timer=0,typingTimer=0,history=[],hidCounter=0,longPressTimer=0,longPressFired=false,lanAllowed=false,pendingHistoryPayload="",pendingHistoryValue="",lanIps=[];const historyKey="vrcChatboxHistory",historyLimitKey="vrcChatboxHistoryLimit",lanUrlKey="vrcChatboxLanUrl";function getHistoryLimit(){let n=parseInt(localStorage.getItem(historyLimitKey)||histLimit.value||"100",10);if(!isFinite(n)||n<1)n=100;if(n>200)n=200;histLimit.value=n;return n}settingsSrc.innerHTML=src.innerHTML;settingsDst.innerHTML=dst.innerHTML;settingsFmt.innerHTML=fmt.innerHTML;function syncSettingsFromQuick(){settingsSrc.value=src.value;settingsDst.value=dst.value;settingsFmt.value=fmt.value}function syncQuickFromSettings(){src.value=settingsSrc.value;dst.value=settingsDst.value;fmt.value=settingsFmt.value}const I18N={"zh":{"connected":"本地服务已连接","lanTitle":"局域网访问地址","lanNote":"可在同一路由其他设备访问，如连接路由器wifi的手机","localOnly":"仅本机","settings":"设置","qr":"二维码","allowLan":"允许局域网连接","lanQr":"局域网二维码","close":"关闭","startup":"开机自启动","startMinimized":"最小化自启动（开机启动时不打开浏览器）","enableTranslate":"启用翻译","uiLang":"UI 语言","srcLang":"源语言","dstLang":"目标语言","provider":"翻译服务","warn":"Key 会保存到本机 settings.json。不要把这个文件复制或发送给任何人。若 MyMemory 翻译失败或提示额度不足，请尝试填写 email，或自行获取 key 后使用。","mmEmail":"MyMemory email，可提升免费额度","mmKey":"MyMemory key，可选","mmKeyLink":"获取 MyMemory key","aiEndpoint":"AI Base URL，例如 https://api.openai.com/v1","aiModel":"模型，例如 gpt-4o-mini / deepseek-chat","aiKey":"AI API Key","format":"翻译格式","fmtBoth":"原文 + 译文","fmtTrans":"仅译文","fmtOrig":"仅原文（不翻译）","send":"发送","translateSend":"翻译发送","clear":"清空","enterSend":"Enter 发送，Shift + Enter 换行","enterAction":"Enter {action}，Shift + Enter 换行","phDirect":"输入要直接发送到 VRChat Chatbox 的文字。","phOrig":"输入要发送的文字（不翻译）。","phTrans":"输入源语言。发送时仅发送译文。","phBoth":"输入源语言。发送时会把译文换行拼接到源语言后面。","lanFail":"开启失败","allowed":"已允许","retry":"重试","opening":"正在开启","lanOk":"已允许局域网连接","lanBad":"局域网连接开启失败","empty":"请输入内容后再发送。","translating":"翻译中...","sending":"发送中...","sentTrans":"已翻译并发送到 VRChat。","sent":"已发送到 VRChat。","sentStatus":"刚刚发送成功","missingAI":"请先填写 AI endpoint、model 和 API Key。","emptyTrans":"翻译失败或返回为空，请检查 API 配置或切换格式。","transFail":"翻译失败或发送失败。若使用 MyMemory，请尝试填写 email，或点击按钮自行获取 key 后使用。","sendFail":"发送失败，请确认 VRChat OSC 已开启。","badConn":"连接异常","historyFilled":"已填入历史消息，修改后按 Enter 发送","qrAddress":"二维码地址","qrSaved":"已保存","qrAuto":"自动检测","qrCurrent":"当前访问","qrCustom":"手动输入","historyLimit":"\u5386\u53f2\u8bb0\u5f55\u4e0a\u9650","historyResendReady":"\u5df2\u586b\u5165\u5386\u53f2\u53d1\u9001\u5185\u5bb9\uff0c\u53ef\u7f16\u8f91\u540e\u624b\u52a8\u53d1\u9001","exportHistory":"导出历史","resending":"重发中...","resent":"已重发到 VRChat。","resentStatus":"刚刚重发成功","resendFail":"重发失败，请确认 VRChat OSC 已开启。"},"en":{"connected":"Local service connected","lanTitle":"LAN access URL","lanNote":"Use another device on the same router, such as a phone on Wi-Fi.","localOnly":"Local only","settings":"Settings","qr":"QR","allowLan":"Allow LAN access","lanQr":"LAN QR code","close":"Close","startup":"Start with Windows","startMinimized":"Start minimized (do not open browser on startup)","enableTranslate":"Enable translation","uiLang":"UI language","srcLang":"Source language","dstLang":"Target language","provider":"Translation provider","warn":"Keys are saved locally in settings.json. Do not copy or share this file. If MyMemory fails or quota is low, add an email or use your own key.","mmEmail":"MyMemory email for higher free quota","mmKey":"MyMemory key, optional","mmKeyLink":"Get MyMemory key","aiEndpoint":"AI Base URL, e.g. https://api.openai.com/v1","aiModel":"Model, e.g. gpt-4o-mini / deepseek-chat","aiKey":"AI API Key","format":"Send format","fmtBoth":"Original + translation","fmtTrans":"Translation only","fmtOrig":"Original only (no translation)","send":"Send","translateSend":"Translate + send","clear":"Clear","enterSend":"Enter to send, Shift + Enter for newline","enterAction":"Enter to {action}, Shift + Enter for newline","phDirect":"Type text to send directly to VRChat Chatbox.","phOrig":"Type text to send without translation.","phTrans":"Type source text. Only the translation will be sent.","phBoth":"Type source text. Translation will be appended on the next line.","lanFail":"Failed to enable","allowed":"Allowed","retry":"Retry","opening":"Enabling","lanOk":"LAN access allowed","lanBad":"Failed to enable LAN access","empty":"Type something before sending.","translating":"Translating...","sending":"Sending...","sentTrans":"Translated and sent to VRChat.","sent":"Sent to VRChat.","sentStatus":"Sent just now","missingAI":"Fill in AI endpoint, model, and API key first.","emptyTrans":"Translation failed or returned empty. Check API settings or switch format.","transFail":"Translation or sending failed. If using MyMemory, try adding an email or your own key.","sendFail":"Send failed. Make sure VRChat OSC is enabled.","badConn":"Connection issue","historyFilled":"History message restored. Edit it, then press Enter to send.","qrAddress":"QR address","qrSaved":"Saved","qrAuto":"Auto detected","qrCurrent":"Current access","qrCustom":"Manual input","historyLimit":"History limit","historyResendReady":"History content restored. Edit if needed, then send manually.","exportHistory":"Export history","resending":"Resending...","resent":"Resent to VRChat.","resentStatus":"Resent just now","resendFail":"Resend failed. Make sure VRChat OSC is enabled."},"ja":{"connected":"ローカルサービスに接続済み","lanTitle":"LANアクセスURL","lanNote":"同じルーター上の端末、たとえばWi-Fi接続のスマートフォンからアクセスできます。","localOnly":"このPCのみ","settings":"設定","qr":"QR","allowLan":"LAN接続を許可","lanQr":"LAN QRコード","close":"閉じる","startup":"Windows起動時に開始","startMinimized":"最小化起動（自動起動時にブラウザーを開かない）","enableTranslate":"翻訳を有効化","uiLang":"UI言語","srcLang":"元の言語","dstLang":"翻訳先言語","provider":"翻訳サービス","warn":"キーはローカルの settings.json に保存されます。このファイルをコピー、共有しないでください。MyMemoryが失敗する場合や上限に近い場合は、メールアドレスまたは自分のキーを設定してください。","mmEmail":"MyMemory email（無料枠を増やす）","mmKey":"MyMemory key（任意）","mmKeyLink":"MyMemory keyを取得","aiEndpoint":"AI Base URL 例: https://api.openai.com/v1","aiModel":"モデル 例: gpt-4o-mini / deepseek-chat","aiKey":"AI API Key","format":"送信形式","fmtBoth":"原文 + 翻訳","fmtTrans":"翻訳のみ","fmtOrig":"原文のみ（翻訳しない）","send":"送信","translateSend":"翻訳して送信","clear":"クリア","enterSend":"Enterで送信、Shift + Enterで改行","enterAction":"Enterで{action}、Shift + Enterで改行","phDirect":"VRChat Chatbox に直接送信する文字を入力します。","phOrig":"翻訳せず送信する文字を入力します。","phTrans":"元の言語で入力します。送信時は翻訳のみ送ります。","phBoth":"元の言語で入力します。翻訳を次の行に追加して送信します。","lanFail":"有効化に失敗","allowed":"許可済み","retry":"再試行","opening":"有効化中","lanOk":"LAN接続を許可しました","lanBad":"LAN接続の有効化に失敗しました","empty":"内容を入力してから送信してください。","translating":"翻訳中...","sending":"送信中...","sentTrans":"翻訳してVRChatへ送信しました。","sent":"VRChatへ送信しました。","sentStatus":"送信しました","missingAI":"AI endpoint、model、API Key を先に入力してください。","emptyTrans":"翻訳に失敗したか、空の結果です。API設定または形式を確認してください。","transFail":"翻訳または送信に失敗しました。MyMemoryを使う場合はメールまたはキーを設定してください。","sendFail":"送信に失敗しました。VRChat OSC が有効か確認してください。","badConn":"接続エラー","historyFilled":"履歴を入力欄に戻しました。編集してEnterで送信できます。","resending":"再送信中...","resent":"VRChatへ再送信しました。","resentStatus":"再送信しました","resendFail":"再送信に失敗しました。VRChat OSC が有効か確認してください。"},"ko":{"connected":"로컬 서비스 연결됨","lanTitle":"LAN 접속 주소","lanNote":"같은 라우터의 다른 기기, 예를 들어 Wi-Fi에 연결된 휴대폰에서 접속할 수 있습니다.","localOnly":"이 PC만","settings":"설정","qr":"QR","allowLan":"LAN 접속 허용","lanQr":"LAN QR 코드","close":"닫기","startup":"Windows 시작 시 실행","startMinimized":"최소화 시작(자동 시작 시 브라우저 열지 않음)","enableTranslate":"번역 사용","uiLang":"UI 언어","srcLang":"원본 언어","dstLang":"대상 언어","provider":"번역 서비스","warn":"키는 로컬 settings.json에 저장됩니다. 이 파일을 복사하거나 공유하지 마세요. MyMemory가 실패하거나 한도가 부족하면 email 또는 개인 key를 설정하세요.","mmEmail":"MyMemory email, 무료 한도 증가","mmKey":"MyMemory key, 선택 사항","mmKeyLink":"MyMemory key 받기","aiEndpoint":"AI Base URL 예: https://api.openai.com/v1","aiModel":"모델 예: gpt-4o-mini / deepseek-chat","aiKey":"AI API Key","format":"전송 형식","fmtBoth":"원문 + 번역","fmtTrans":"번역만","fmtOrig":"원문만(번역 안 함)","send":"전송","translateSend":"번역 후 전송","clear":"지우기","enterSend":"Enter 전송, Shift + Enter 줄바꿈","enterAction":"Enter {action}, Shift + Enter 줄바꿈","phDirect":"VRChat Chatbox로 바로 보낼 문장을 입력하세요.","phOrig":"번역하지 않고 보낼 문장을 입력하세요.","phTrans":"원본 언어로 입력하세요. 전송 시 번역만 보냅니다.","phBoth":"원본 언어로 입력하세요. 번역을 다음 줄에 붙여 보냅니다.","lanFail":"활성화 실패","allowed":"허용됨","retry":"다시 시도","opening":"활성화 중","lanOk":"LAN 접속을 허용했습니다","lanBad":"LAN 접속 활성화 실패","empty":"내용을 입력한 뒤 전송하세요.","translating":"번역 중...","sending":"전송 중...","sentTrans":"번역 후 VRChat에 전송했습니다.","sent":"VRChat에 전송했습니다.","sentStatus":"방금 전송됨","missingAI":"AI endpoint, model, API Key를 먼저 입력하세요.","emptyTrans":"번역 실패 또는 빈 결과입니다. API 설정이나 형식을 확인하세요.","transFail":"번역 또는 전송에 실패했습니다. MyMemory 사용 시 email 또는 개인 key를 설정해 보세요.","sendFail":"전송 실패. VRChat OSC가 켜져 있는지 확인하세요.","badConn":"연결 오류","historyFilled":"히스토리 메시지를 입력창에 넣었습니다. 수정 후 Enter로 전송하세요.","resending":"재전송 중...","resent":"VRChat에 재전송했습니다.","resentStatus":"방금 재전송됨","resendFail":"재전송 실패. VRChat OSC가 켜져 있는지 확인하세요."}};let lang="zh";function pickLang(v){let n=(v&&v!=="auto"?v:(navigator.language||"zh")).toLowerCase();if(n.startsWith("ja"))return"ja";if(n.startsWith("ko"))return"ko";if(n.startsWith("en"))return"en";return"zh"}function L(k){return(I18N[lang]&&I18N[lang][k])||I18N.zh[k]||k}function tx(el,k){if(el)el.textContent=L(k)}function opt(el,i,k){if(el&&el.options[i])el.options[i].textContent=L(k)}function lab(input,k){if(!input)return;let n=input.nextSibling;if(n)n.nodeValue=L(k)}function applyLang(){lang=pickLang(uiLang.value);document.documentElement.lang=lang==="zh"?"zh-CN":lang;tx(s,"connected");tx(document.querySelector(".lan b"),"lanTitle");tx(document.querySelector(".lan-note"),"lanNote");tx(settingsBtn,"settings");tx(qrBtn,"qr");tx(document.querySelector("#qrModal .ph b"),"lanQr");tx(qrClose,"close");tx(qrHostLabel,"qrAddress");tx(document.querySelector("#settingsModal .ph b"),"settings");tx(settingsClose,"close");tx(uiLangLabel,"uiLang");tx(histLimitLabel,"historyLimit");lab(startup,"startup");lab(startMinimized,"startMinimized");lab(trOn,"enableTranslate");tx(srcLabel,"srcLang");tx(dstLabel,"dstLang");tx(settingsSrcLabel,"srcLang");tx(settingsDstLabel,"dstLang");tx(settingsFmtLabel,"format");tx(providerLabel,"provider");tx(document.querySelector(".warn"),"warn");mmEmail.placeholder=L("mmEmail");mmKey.placeholder=L("mmKey");tx(document.querySelector(".linkbtn"),"mmKeyLink");ep.placeholder=L("aiEndpoint");model.placeholder=L("aiModel");key.placeholder=L("aiKey");tx(fmtLabel,"format");opt(fmt,0,"fmtBoth");opt(fmt,1,"fmtTrans");opt(fmt,2,"fmtOrig");opt(settingsFmt,0,"fmtBoth");opt(settingsFmt,1,"fmtTrans");opt(settingsFmt,2,"fmtOrig");tx(clearBtn,"clear");tx(exportHistory,"exportHistory");setLanState(qrBtn.dataset.ip||"127.0.0.1",qrBtn.dataset.fail==="1");showBoxes()}const sid=(Date.now().toString(36)+Math.random().toString(36).slice(2,10)).slice(0,31);function beat(){fetch("/heartbeat?id="+encodeURIComponent(sid),{method:"POST"}).catch(()=>{})}beat();setInterval(beat,3000);function setTyping(on){if(!on){try{navigator.sendBeacon&&navigator.sendBeacon("/typing","false")}catch(e){}}fetch("/typing",{method:"POST",body:on?"true":"false",keepalive:true}).catch(function(){})}function sendTyping(){setTyping(!!t.value.trim())}window.addEventListener("pagehide",function(){setTyping(false)});function openSettings(){settingsModal.className="modal"}function closeSettings(){settingsModal.className="modal hide"}settingsBtn.addEventListener("click",openSettings);settingsClose.addEventListener("click",closeSettings);settingsModal.addEventListener("click",function(e){if(e.target===settingsModal)closeSettings()});function normLanUrl(v){v=(v||"").trim();if(!v)return"";if(/^https?:\/\//i.test(v))return v;if(v.indexOf(":")<0)v+=":19001";return"http://"+v}function addLanChoice(a,u,label){u=normLanUrl(u);if(!u)return;for(let i=0;i<a.length;i++)if(a[i].url===u)return;a.push({url:u,label:label})}function lanChoiceList(ip){let a=[],saved=localStorage.getItem(lanUrlKey)||"";if(/^https?:\/\/0\./i.test(saved)){localStorage.removeItem(lanUrlKey);saved=""}addLanChoice(a,saved,L("qrSaved"));if(ip&&ip!=="127.0.0.1")addLanChoice(a,"http://"+ip+":19001",L("qrAuto"));(lanIps||[]).forEach(x=>addLanChoice(a,"http://"+x+":19001",L("qrAuto")));if(location.hostname&&location.hostname!=="127.0.0.1"&&location.hostname!=="localhost")addLanChoice(a,location.origin,L("qrCurrent"));return a}function escOpt(v){return v.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;")}function renderLanChoices(ip){let a=lanChoiceList(ip);qrChoice.innerHTML=a.map(x=>"<option value=\""+escOpt(x.url)+"\">"+escOpt(x.label+": "+x.url)+"</option>").join("")+"<option value=\"__custom\">"+L("qrCustom")+"</option>";let u=localStorage.getItem(lanUrlKey)||qrBtn.dataset.url||(a[0]&&a[0].url)||"";if(u)setQrUrl(u,false)}function setQrUrl(u,persist=true){u=normLanUrl(u);if(!u)return;if(persist)localStorage.setItem(lanUrlKey,u);qrBtn.dataset.url=u;qrHost.value=u;drawQr(qrCanvas,u);qrLink.href=u;qrLink.textContent=u;let found=false;for(let i=0;i<qrChoice.options.length;i++){if(qrChoice.options[i].value===u){qrChoice.value=u;found=true;break}}if(!found)qrChoice.value="__custom"}function openQr(){let u=qrBtn.dataset.url;if(!u)return;renderLanChoices(qrBtn.dataset.ip||"127.0.0.1");qrModal.className="modal"}function closeQr(){qrModal.className="modal hide"}qrBtn.addEventListener("click",openQr);qrChoice.addEventListener("change",function(){if(qrChoice.value==="__custom"){qrHost.focus();return}setQrUrl(qrChoice.value)});qrHost.addEventListener("change",function(){setQrUrl(qrHost.value)});qrClose.addEventListener("click",closeQr);qrModal.addEventListener("click",function(e){if(e.target===qrModal)closeQr()});document.addEventListener("keydown",function(e){if(e.key==="Escape"){closeSettings();closeQr()}});function setLanState(ip,fail,ips){if(ips&&ips.length)lanIps=ips;const on=!fail&&ip!=="127.0.0.1";const u=on?"http://"+ip+":19001":"",saved=localStorage.getItem(lanUrlKey)||"",shown=saved||u;lanAllowed=on;qrBtn.dataset.ip=ip;qrBtn.dataset.fail=fail?"1":"0";lan.textContent=on?shown:(fail?L("lanFail"):L("localOnly"));qrBtn.className=on?"":"hide";qrBtn.dataset.url=shown;if(qrModal.className==="modal")renderLanChoices(ip);lanBtn.disabled=on;lanBtn.textContent=on?L("allowed"):(fail?L("retry"):L("allowLan"))}async function refreshLan(){try{const r=await fetch("/lan-ip");const j=await r.json();setLanState(j.ip,false,j.ips||[])}catch(e){setLanState("127.0.0.1",false)}}async function enableLan(){lanBtn.disabled=true;lanBtn.textContent=L("opening");try{const r=await fetch("/lan-enable",{method:"POST"});const j=await r.json();const on=j.ip!=="127.0.0.1";setLanState(j.ip,!on,j.ips||[]);if(on)await save();s.textContent=on?L("lanOk"):L("lanBad")}catch(e){setLanState("127.0.0.1",true)}}function drawQr(c,txt){const N=29,D=55,E=15;let bits=[0,1,0,0];for(let i=7;i>=0;i--)bits.push(txt.length>>i&1);for(let ch of txt){let v=ch.charCodeAt(0);for(let i=7;i>=0;i--)bits.push(v>>i&1)}for(let i=0;i<4&&bits.length<D*8;i++)bits.push(0);while(bits.length%8)bits.push(0);let data=[];for(let i=0;i<bits.length;i+=8)data.push(bits.slice(i,i+8).reduce((a,b)=>a*2+b,0));for(let p=0xec;data.length<D;p=p==0xec?0x11:0xec)data.push(p);function gm(a,b){let r=0;for(;b;b>>=1){if(b&1)r^=a;a<<=1;if(a&256)a^=0x11d}return r}function gp(n){let r=1;while(n--)r=gm(r,2);return r}let g=[1];for(let i=0;i<E;i++){let ng=Array(g.length+1).fill(0),a=gp(i);for(let j=0;j<g.length;j++){ng[j]^=g[j];ng[j+1]^=gm(g[j],a)}g=ng}g=g.slice(1);let rem=Array(E).fill(0);for(let b of data){let f=b^rem.shift();rem.push(0);for(let i=0;i<E;i++)rem[i]^=gm(g[i],f)}let cw=data.concat(rem),m=Array.from({length:N},()=>Array(N).fill(-1));function set(x,y,v){if(x>=0&&y>=0&&x<N&&y<N)m[y][x]=v}function finder(x,y){for(let dy=-1;dy<8;dy++)for(let dx=-1;dx<8;dx++){let v=0;if(dx>=0&&dx<7&&dy>=0&&dy<7&&(dx==0||dx==6||dy==0||dy==6||(dx>=2&&dx<=4&&dy>=2&&dy<=4)))v=1;set(x+dx,y+dy,v)}}function align(x,y){for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++)set(x+dx,y+dy,Math.max(Math.abs(dx),Math.abs(dy))!=1?1:0)}finder(0,0);finder(N-7,0);finder(0,N-7);align(22,22);for(let i=8;i<N-8;i++){if(m[6][i]<0)set(i,6,i%2==0);if(m[i][6]<0)set(6,i,i%2==0)}for(let i=0;i<8;i++){set(N-1-i,8,0);set(8,N-1-i,0)}for(let i=0;i<6;i++){set(8,i,0);set(i,8,0)}set(8,7,0);set(8,8,0);set(7,8,0);for(let i=0;i<6;i++)set(5-i,8,0);set(8,21,1);let bi=0;for(let x=N-1,up=true;x>0;x-=2){if(x==6)x--;for(let yy=0;yy<N;yy++){let y=up?N-1-yy:yy;for(let dx=0;dx<2;dx++){let xx=x-dx;if(m[y][xx]<0){let bit=bi<cw.length*8?(cw[bi>>3]>>(7-(bi&7))&1):0;m[y][xx]=bit^((xx+y)%2==0);bi++}}}up=!up}let fmt=0b111011111000100;for(let i=0;i<15;i++){let v=fmt>>i&1;if(i<6)set(8,i,v);else if(i<8)set(8,i+1,v);else if(i==8)set(7,8,v);else set(14-i,8,v);if(i<8)set(N-1-i,8,v);else set(8,N-15+i,v)}let q=4,sc=Math.floor(c.width/(N+q*2)),ctx=c.getContext("2d");ctx.fillStyle="#fff";ctx.fillRect(0,0,c.width,c.height);ctx.fillStyle="#111827";for(let y=0;y<N;y++)for(let x=0;x<N;x++)if(m[y][x])ctx.fillRect((x+q)*sc,(y+q)*sc,sc,sc)}function showBoxes(){let on=trOn.checked,mm=p.value==="mymemory",f=fmt.value;trBox.className=on?"":"hide";quickTr.className=on?"quick":"quick hide";mmBox.className=on&&mm?"row":"row hide";aiBox.className=on&&!mm?"row":"row hide";let lb=f==="orig"?L("send"):L("translateSend");b.textContent=on?lb:L("send");hint.textContent=on?L("enterAction").replace("{action}",lb):L("enterSend");t.placeholder=on?(f==="orig"?L("phOrig"):f==="trans"?L("phTrans"):L("phBoth")):L("phDirect")}function preset(force){const ps={openai:["https://api.openai.com/v1","gpt-4o-mini"],deepseek:["https://api.deepseek.com","deepseek-chat"],hunyuan:["https://api.hunyuan.cloud.tencent.com/v1","hunyuan-turbos-latest"]}[p.value];if(!ps)return;if(force||!ep.value)ep.value=ps[0];if(force||!model.value)model.value=ps[1]}function syncStartup(){startMinimized.disabled=!startup.checked;if(!startup.checked)startMinimized.checked=false}async function load(){try{const r=await fetch("/settings");const j=await r.json();trOn.checked=!!j.translate;src.value=j.src||src.value;dst.value=j.dst||dst.value;p.value=j.provider||p.value;ep.value=j.endpoint||"";model.value=j.model||"";key.value=j.key||"";mmEmail.value=j.mmEmail||"";mmKey.value=j.mmKey||"";fmt.value=j.format||fmt.value;syncSettingsFromQuick();uiLang.value=j.uiLang||"auto";lang=pickLang(uiLang.value);startup.checked=!!j.startup;startMinimized.checked=!!j.startMinimized;lanAllowed=!!j.lan;syncStartup();preset(false);applyLang()}catch(e){syncStartup();applyLang()}}async function save(){clearTimeout(timer);syncStartup();const j={translate:trOn.checked,src:src.value,dst:dst.value,provider:p.value,endpoint:ep.value,model:model.value,key:key.value,mmEmail:mmEmail.value,mmKey:mmKey.value,format:fmt.value,uiLang:uiLang.value,startup:startup.checked,startMinimized:startMinimized.checked,lan:lanAllowed};try{await fetch("/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(j)})}catch(e){}}uiLang.addEventListener("change",()=>{applyLang();save()});histLimit.addEventListener("change",()=>{localStorage.setItem(historyLimitKey,getHistoryLimit());trimHistory();saveHistory()});trOn.addEventListener("change",()=>{showBoxes();save()});startup.addEventListener("change",()=>{syncStartup();save()});startMinimized.addEventListener("change",save);function quickTranslateChanged(){syncSettingsFromQuick();showBoxes();save()}function settingsTranslateChanged(){syncQuickFromSettings();showBoxes();save()}[src,dst,fmt].forEach(x=>x.addEventListener("change",quickTranslateChanged));[settingsSrc,settingsDst,settingsFmt].forEach(x=>x.addEventListener("change",settingsTranslateChanged));p.addEventListener("change",()=>{preset(true);showBoxes();save()});[ep,model,key,mmEmail,mmKey].forEach(x=>x.addEventListener("change",save));[key,ep,model,mmEmail,mmKey].forEach(x=>x.addEventListener("input",()=>{clearTimeout(timer);timer=setTimeout(save,600)}));async function tr(v){if(p.value!=="mymemory")return trAI(v);let u="https://api.mymemory.translated.net/get?q="+encodeURIComponent(v)+"&langpair="+encodeURIComponent(src.value+"|"+dst.value);if(mmEmail.value)u+="&de="+encodeURIComponent(mmEmail.value);if(mmKey.value)u+="&key="+encodeURIComponent(mmKey.value);let r=await fetch(u);let j=await r.json();return j.responseData&&j.responseData.translatedText?j.responseData.translatedText:""}function chatUrl(){let u=ep.value.trim().replace(/\/+$/,"");return u.endsWith("/chat/completions")?u:u+"/chat/completions"}async function trAI(v){if(!ep.value||!model.value||!key.value)throw Error("missing ai settings");let r=await fetch(chatUrl(),{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+key.value},body:JSON.stringify({model:model.value,messages:[{role:"system",content:"Translate the user text to "+dst.value+". Return only the translation."},{role:"user",content:v}]})});let j=await r.json();return j.choices&&j.choices[0]&&j.choices[0].message?j.choices[0].message.content:""}async function sendText(){const v=t.value.trim();if(!v){m.textContent=L("empty");m.className="m e";return}b.disabled=true;m.textContent=trOn.checked?L("translating"):L("sending");m.className="m";try{await save();if(pendingHistoryPayload&&v===pendingHistoryValue){const r=await fetch("/send",{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body:pendingHistoryPayload});if(!r.ok)throw Error();pendingHistoryPayload="";pendingHistoryValue="";t.value="";cnt.textContent="0/144";cnt.style.color="#9ca3af";clearInterval(typingTimer);typingTimer=0;setTyping(false);m.textContent=L("sent");s.textContent=L("sentStatus");return}pendingHistoryPayload="";pendingHistoryValue="";let tv="",out="";if(trOn.checked&&fmt.value!=="orig"){tv=await tr(v)}if(trOn.checked&&fmt.value!=="orig"&&!tv){throw Error("empty trans")}if(trOn.checked){if(fmt.value==="trans")out=tv;else if(fmt.value==="orig")out=v;else out=v+"\n"+tv}else{out=v}const r=await fetch("/send",{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body:out});if(!r.ok)throw Error();var h={hid:++hidCounter,text:v,trans:tv,payload:out,src:src.value,dst:dst.value,fmt:fmt.value,time:new Date().toLocaleTimeString()};history.unshift(h);prependHistoryItem(h);trimHistory();saveHistory();t.value="";cnt.textContent="0/144";cnt.style.color="#9ca3af";clearInterval(typingTimer);typingTimer=0;setTyping(false);m.textContent=trOn.checked?L("sentTrans"):L("sent");s.textContent=L("sentStatus")}catch(e){m.textContent=e.message==="missing ai settings"?L("missingAI"):e.message==="empty trans"?L("emptyTrans"):trOn.checked?L("transFail"):L("sendFail");m.className="m e";s.textContent=L("badConn")}finally{b.disabled=false;t.focus()}}t.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendText()}});t.addEventListener("input",function(){clearTimeout(timer);timer=setTimeout(function(){sendTyping()},300);if(t.value.trim()){if(!typingTimer)typingTimer=setInterval(sendTyping,5000)}else{clearInterval(typingTimer);typingTimer=0;setTyping(false)}var n=t.value.length;cnt.textContent=n+"/144";cnt.style.color=n>144?"#ef4444":"#9ca3af"});b.addEventListener("click",sendText);lanBtn.addEventListener("click",enableLan);exportHistory.addEventListener("click",function(){if(!history.length)return;let data=history.slice().reverse().map(h=>"["+h.time+"] "+h.text+(h.trans?"\n"+h.trans:"")).join("\n\n"),a=document.createElement("a");a.href=URL.createObjectURL(new Blob([data],{type:"text/plain;charset=utf-8"}));a.download="vrc-chatbox-history.txt";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)});clearBtn.addEventListener("click",function(){t.value="";t.focus();cnt.textContent="0/144";cnt.style.color="#9ca3af";clearInterval(typingTimer);typingTimer=0;setTyping(false)});function saveHistory(){try{localStorage.setItem(historyKey,JSON.stringify(history));fetch("/history",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(history),keepalive:true}).catch(()=>{})}catch(e){}}async function loadHistory(){getHistoryLimit();let data=null;try{let r=await fetch("/history");if(r.ok)data=await r.json()}catch(e){}try{history=((data&&data.length?data:JSON.parse(localStorage.getItem(historyKey)||"[]"))||[]).slice(0,getHistoryLimit()).map(function(h){h.hid=++hidCounter;return h});renderHistory()}catch(e){history=[]}}function syncHistoryBar(){hbar.className=history.length?"hbar":"hbar hide"}function renderHistory(){hlist.innerHTML=history.map(function(h){return buildItemHTML(h)}).join("");syncHistoryBar()}function findByHid(hid){for(var i=0;i<history.length;i++)if(history[i].hid===hid)return i;return -1}function buildItemHTML(h){return "<div class=\"hitem\" id=\"hitem-"+h.hid+"\" onpointerdown=\"startLongPress(event,"+h.hid+")\" onpointerup=\"endLongPress(event,"+h.hid+")\" onpointercancel=\"cancelLongPress()\" onpointerleave=\"cancelLongPress()\"><span class=\"htext\"><span class=\"hsrc\">"+h.text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;")+"</span><span class=\"htrans\">"+(h.trans||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;")+"</span></span><span class=\"htime\">"+h.time+"</span><span class=\"del\" onpointerdown=\"event.stopPropagation()\" onpointerup=\"event.stopPropagation()\" onclick=\"event.stopPropagation();delHistory("+h.hid+")\">&times;</span></div>"}function prependHistoryItem(h){hlist.insertAdjacentHTML("afterbegin",buildItemHTML(h));syncHistoryBar()}function trimHistory(){let maxHistory=getHistoryLimit();while(history.length>maxHistory){var old=history.pop(),el=$("hitem-"+old.hid);if(el)el.remove()}syncHistoryBar()}function startLongPress(e,hid){e.preventDefault();clearTimeout(longPressTimer);longPressFired=false;var el=$("hitem-"+hid);if(el)el.classList.add("pressing");longPressTimer=setTimeout(function(){longPressFired=true;if(el)el.classList.remove("pressing");fillResendFromHistory(hid)},600)}function endLongPress(e,hid){e.preventDefault();clearTimeout(longPressTimer);var el=$("hitem-"+hid);if(el)el.classList.remove("pressing");if(!longPressFired){var i=findByHid(hid);if(i>=0){t.value=history[i].text;t.focus();m.textContent=L("historyFilled");m.className="m"}}}function cancelLongPress(){clearTimeout(longPressTimer);var els=document.querySelectorAll(".hitem.pressing");for(var j=0;j<els.length;j++)els[j].classList.remove("pressing")}function buildHistoryOut(h){if(h.src===src.value&&h.dst===dst.value)return h.payload||h.text;return trOn.checked?(fmt.value==="trans"?(h.trans||h.text):fmt.value==="orig"?h.text:h.text+(h.trans?"\n"+h.trans:"")):h.text}function fillResendFromHistory(hid){var i=findByHid(hid);if(i<0)return;var h=history[i],out=buildHistoryOut(h);pendingHistoryPayload=out;pendingHistoryValue=out;t.value=out;t.focus();var n=t.value.length;cnt.textContent=n+"/144";cnt.style.color=n>144?"#ef4444":"#9ca3af";m.textContent=L("historyResendReady");m.className="m"}function delHistory(hid){var i=findByHid(hid);if(i>=0)history.splice(i,1);var el=$("hitem-"+hid);if(el)el.remove();syncHistoryBar();saveHistory()}syncStartup();syncSettingsFromQuick();loadHistory();applyLang();load();refreshLan();</script></body></html>'
 html_len = $ - html
 
 server_socket dd 0
@@ -1745,10 +2007,16 @@ sockaddr_len dd 16
 accept_timeout dd 1000
 readfds dd 0,0
 select_timeout dd 1,0
-hlist_ptr dd 0
+if_ptr dd 0
+if_count dd 0
+ip_table_len dd 4096
 best_ip_score dd 0
-hostname rb 256
 best_ip rb 16
+if_text rb 16
+selected_ip rb 16
+lan_first dd 0
+lan_json_ptr dd 0
+lan_json rb 512
 tray_wc WNDCLASS
 tray_nid NOTIFYICONDATAA
 msg MSG
@@ -1782,6 +2050,8 @@ settings_buf rb settings_buf_size
 exe_path rb 260
 startup_cmd rb 320
 osc_packet rb 8192
+ip_table_size = 4096
+ip_table rb ip_table_size
 
 section '.idata' import data readable writeable
 
@@ -1789,6 +2059,7 @@ library kernel32,'KERNEL32.DLL',\
         advapi32,'ADVAPI32.DLL',\
         user32,'USER32.DLL',\
         shell32,'SHELL32.DLL',\
+        iphlpapi,'IPHLPAPI.DLL',\
         wsock32,'WSOCK32.DLL'
 
 include '..\tools\fasm\include\api\kernel32.inc'
@@ -1802,6 +2073,9 @@ import advapi32,\
        RegDeleteValue,'RegDeleteValueA',\
        RegOpenKeyEx,'RegOpenKeyExA',\
        RegSetValueEx,'RegSetValueExA'
+
+import iphlpapi,\
+       GetIpAddrTable,'GetIpAddrTable'
 
 section '.rsrc' resource data readable
 

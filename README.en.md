@@ -17,18 +17,18 @@ This version has been rewritten from Node.js to 32-bit Win32 assembly and is bui
 - By default, access is local-only and the server listens on `127.0.0.1:19001`.
 - The page provides an "Allow LAN access" button. Only after the user explicitly enables it does the server listen on `0.0.0.0:19001`.
 - After LAN access is enabled, the page shows the LAN access URL and a QR button. Clicking it opens a floating QR code that phones can scan to open the LAN URL directly.
-- The LAN address is selected only from common private IPv4 ranges: `192.168.0.0/16`, `10.0.0.0/8`, and `172.16.0.0/12`.
+- LAN address choices are listed from the system IPv4 address table and do not depend on adapter names. The default prefers `192.168.*`, then `10.*`, then `172.16-31.*`, and finally falls back to other non-loopback IPv4 addresses.
 - Sends OSC to VRChat at `127.0.0.1:9000` with address `/chatbox/input`.
 - Sends VRChat typing state through `/chatbox/typing` while the user is typing. The page tries to turn typing off when text is sent, cleared, or the page is left.
 - Default source language is Chinese, default target language is English.
-- Click "Settings" to change startup, translation, and send formats: original + translation, translation only, and original only.
+- Use the controls above the input box to change source language, target language, and send format: original + translation, translation only, and original only. Click "Settings" to change startup, translation, provider, and API settings.
 - Free public translation through MyMemory.
 - Optional MyMemory email for a higher free quota, and optional MyMemory key for private TM/authenticated usage.
 - Optional AI translation through OpenAI-compatible chat completion APIs.
 - Page heartbeat: each page creates its own session id and sends periodic heartbeats.
 - The background service does not exit automatically when pages are closed or heartbeats stop; use the tray menu to exit it.
 - If an old service is already running, launching the exe again skips server startup and only opens the existing page.
-- The page keeps the most recent 20 sent messages. The history sits below the send status text and scrolls when it exceeds its maximum height. Long-press a history item to resend the exact payload that was sent at the time, or click it to put the original text back into the input box.
+- The page keeps sent history in browser localStorage and in `history.json` beside the executable. The history limit is configurable in Settings. The history sits below the send status text and scrolls when it exceeds its maximum height. Click a history item to restore the original text. Long-press a history item to restore the content to be sent, then click Send manually, or export the history to a text file.
 
 ## Supported AI APIs
 
@@ -90,13 +90,13 @@ This file may contain your API key or MyMemory key. Do not copy it, upload it, c
 2. Run `vrc-chatbox-osc.exe`.
 3. Windows opens `http://127.0.0.1:19001` in your default browser.
 4. Right-click the tray icon in the Windows notification area to choose "Open UI" or "Exit".
-5. Click "Settings" to change UI language, translation, languages, provider, send format, startup, and minimized startup.
+5. Use the controls above the input box to change languages and send format. Click "Settings" to change UI language, translation, provider, API settings, startup, and minimized startup.
 6. Type text and press `Enter` to send or translate and send.
 7. Press `Shift + Enter` for a newline.
 8. Click "Clear" to clear the input box and turn typing state off.
 9. Click a history item to restore its original text, or long-press it to resend it.
 
-To use phones or other LAN devices, click "Allow LAN access" at the top of the page first. After it is enabled, the page shows the access URL and a QR button. Scan it or open this manually on another device in the same network:
+To use phones or other LAN devices, click "Allow LAN access" at the top of the page first. After it is enabled, the page shows the access URL and a QR button. Scan it or open this manually on another device in the same network. If the QR address points to a virtual or wrong adapter, use the QR dialog dropdown to choose a detected LAN address, current-access address, or saved address, or manually enter the correct IP, host name, or full URL; the page remembers the last selected or entered value:
 
 ```text
 http://<this-pc-lan-ip>:19001
